@@ -1,0 +1,230 @@
+"""
+HD Security Monitor - USB Webcam Application
+Author: GumbiTech
+GitHub: https://github.com/GumbiTech
+License: MIT
+
+A professional-grade security monitoring application with multiple vision filters,
+dynamic USB webcam support, and advanced image processing features.
+"""
+
+import cv2
+import numpy as np
+import time
+import os
+import pyttsx3
+from plyer import notification
+import keyboard
+from pygrabber.dshow_graph import FilterGraph
+from datetime import datetime
+
+# --- INITIAL SETUP ---
+engine = pyttsx3.init('sapi5')
+engine.setProperty('rate', 150)
+
+# Define camera selection function first
+def get_camera_by_name():
+    graph = FilterGraph()
+    devices = graph.get_input_devices()
+    
+    print("--- Available Cameras ---")
+    for index, name in enumerate(devices):
+        print(f"[{index}] : {name}")
+
+    selection = int(input("enter the index of the camera to use: "))
+    return selection, devices[selection]
+
+def set_optimal_resolution(cap):
+    """
+    Try to set camera to 1080p, force 720p if not available
+    Minimum resolution is 720p (1280x720) - will NOT go lower
+    """
+    # Try 1080p first
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    if width == 1920 and height == 1080:
+        print("✓ Camera resolution set to 1080p (1920x1080)")
+        return 1920, 1080
+    
+    # Force 720p if 1080p not available
+    print("⚠ 1080p not supported. Forcing 720p (1280x720)...")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    print(f"✓ Camera resolution forced to: {width}x{height}")
+    return 1280, 720  # Always return 720p values to force this resolution
+
+def apply_nvg_effect(frame):
+    """
+    Apply Night Vision Goggles style effect:
+    - Green monochrome with strong contrast
+    - Glowing highlights with dark background
+    - Sensor noise and vignette for authentic NVG feel
+    """
+    # Convert to grayscale
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Apply CLAHE for bright highlights and dark shadows (high contrast)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    
+    # Apply slight Gaussian blur + add glow effect
+    blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
+    glow = cv2.addWeighted(enhanced, 0.7, blurred, 0.3, 0)
+    
+    # Create green channel - convert to green monochrome
+    green_frame = cv2.cvtColor(glow, cv2.COLOR_GRAY2BGR)
+    green_frame[:, :, 0] = 0  # Blue channel to 0
+    green_frame[:, :, 1] = glow  # Green channel gets the enhanced image
+    green_frame[:, :, 2] = 0  # Red channel to 0
+    
+    # Add vignette (dark corners)
+    rows, cols = glow.shape
+    kernel_x = cv2.getGaussianKernel(cols, cols/2)
+    kernel_y = cv2.getGaussianKernel(rows, rows/2)
+    kernel = kernel_y * kernel_x.T
+    mask = kernel / kernel.max()
+    mask = np.dstack([mask] * 3)
+    green_frame = (green_frame * mask).astype(np.uint8)
+    
+    return green_frame
+
+# Get camera selection from user
+selected_camera, camera_name = get_camera_by_name()
+win_name = camera_name
+cap = cv2.VideoCapture(selected_camera)
+
+# Set optimal resolution (1080p or force 720p)
+camera_width, camera_height = set_optimal_resolution(cap)
+
+# Force the camera to be brighter
+cap.set(cv2.CAP_PROP_BRIGHTNESS, 230) # Range is usually 0-255 (Try 200 if 150 is still dark)
+cap.set(cv2.CAP_PROP_CONTRAST, 130)   # Makes the colors pop more
+cap.set(cv2.CAP_PROP_EXPOSURE, -4)    # Adjusts how much light the sensor grabs
+
+
+# Intelligent Background Subtractor (MOG2)
+# detectShadows=True helps ignore shadows cast by sun/lamps
+back_sub = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=True)
+
+hidden = False
+voice_active = True
+mode = "normal"
+last_capture_time = 0  
+cooldown_period = 10  
+
+def create_window():
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(win_name, cv2.WND_PROP_TOPMOST, 1)
+    cv2.resizeWindow(win_name, 480, 270)
+
+create_window()
+
+ret, frame1 = cap.read()
+if ret:
+    frame1 = cv2.resize(frame1, (camera_width, camera_height))
+
+engine.say("system is now online.")
+engine.runAndWait()
+
+print("Controls:")
+print("1=Normal | 2=Clarity | 3=Noise | 4=Night | 5=NVG")
+print("Ctrl+H = Hide | Ctrl+S = Show | Q = Quit")
+
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+
+    # 1. THE CLEANER PROCESSING (Fixes the "scratches")
+    # We switch to INTER_LINEAR (Bilinear) which creates fewer artifacts than Lanczos
+    frame_hd = cv2.resize(frame, (camera_width, camera_height), interpolation=cv2.INTER_LINEAR)
+   
+    # NEW: A light Gaussian Blur to "settle" the pixels before sharpening
+    frame_hd = cv2.GaussianBlur(frame_hd, (3, 3), 0)
+   
+    # NEW: A Gentler Sharpening Kernel (less "scratchy" than the old one)
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    frame_hd = cv2.filter2D(frame_hd, -1, kernel)
+                           
+    # 2. STEALTH MOTION LOGIC (The "Filter")
+    # This creates a mask where only moving things are white
+    fg_mask = back_sub.apply(frame_hd)
+   
+    # Remove small noise/flickering (Erosion & Dilation)
+    kernel = np.ones((5,5), np.uint8)
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+   
+    # Find the outlines (contours) of moving objects
+    contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+   
+    # --- FILTER MODES ---
+    if mode == "clarity":
+        frame_hd = cv2.bilateralFilter(frame_hd, 9, 75, 75)
+    elif mode == "noise":
+        frame_hd = cv2.medianBlur(frame_hd, 5)
+    elif mode == "night":
+        gray = cv2.cvtColor(frame_hd, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        frame_hd = clahe.apply(gray)
+        frame_hd = cv2.cvtColor(frame_hd, cv2.COLOR_GRAY2BGR)
+    elif mode == "nvg":
+        frame_hd = apply_nvg_effect(frame_hd)
+
+   # Display mode and timestamp
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cv2.putText(frame_hd, f"Mode: {mode}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+    cv2.putText(frame_hd, f"Time: {current_time}", (10, 70),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
+
+    # THE GLOBAL BOSS KEY LOGIC (Hotkey Version)
+   
+  # --- CONTROLS ---
+
+    # Mode switching
+    if keyboard.is_pressed('1'):
+        mode = "normal"
+    elif keyboard.is_pressed('2'):
+        mode = "clarity"
+    elif keyboard.is_pressed('3'):
+        mode = "noise"
+    elif keyboard.is_pressed('4'):
+        mode = "night"
+    elif keyboard.is_pressed('5'):
+        mode = "nvg"
+
+    # Ninja mode (hide + mute)
+    if keyboard.is_pressed('ctrl+h'):
+        if not hidden:
+            cv2.destroyWindow(win_name)
+            hidden = True
+            voice_active = False
+            print("Ninja Mode: ON")
+
+    if keyboard.is_pressed('ctrl+s'):
+        if hidden:
+            create_window()
+            hidden = False
+            voice_active = True
+            print("Ninja Mode: OFF")
+
+    # 4. UI DISPLAY
+    if not hidden:
+        cv2.imshow(win_name, frame_hd)
+   
+    # Use a tiny waitKey so OpenCV can draw the frame
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+    frame1 = frame
+
+cap.release()
+cv2.destroyAllWindows()
